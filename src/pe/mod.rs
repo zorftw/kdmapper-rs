@@ -6,9 +6,16 @@ use winapi::um::winnt::{
     PIMAGE_IMPORT_BY_NAME, PIMAGE_IMPORT_DESCRIPTOR, PIMAGE_NT_HEADERS64, PIMAGE_THUNK_DATA64,
 };
 
+#[derive(Default)]
 pub struct FunctionImportInfo {
     name: String,
-    address: *const u64,
+    address: usize, // NOTE: apparently a pointer to an adress (so void*)
+}
+
+impl FunctionImportInfo {
+    pub fn get_address(&self) -> *const u64 {
+        self.address as _
+    }
 }
 
 pub struct RelocationInfo {
@@ -17,6 +24,7 @@ pub struct RelocationInfo {
     count: i32,
 }
 
+#[derive(Default)]
 pub struct ImportInfo {
     name: String,
     function_info: Vec<FunctionImportInfo>,
@@ -120,12 +128,7 @@ pub fn get_imports(base: *mut u8) -> Option<Vec<ImportInfo>> {
     };
 
     while unsafe { (*current_import_descriptor).FirstThunk } != 0 {
-        #[allow(invalid_value)]
-        let mut info = unsafe {
-            ImportInfo {
-                ..core::mem::zeroed()
-            }
-        };
+        let mut info = ImportInfo::default();
 
         info.name = unsafe {
             CStr::from_ptr(transmute::<usize, *const i8>(
@@ -147,8 +150,8 @@ pub fn get_imports(base: *mut u8) -> Option<Vec<ImportInfo>> {
         };
 
         while unsafe { *(*current_original_first_thunks).u1.Function() != 0 } {
-            #[allow(invalid_value)]
-            let mut function_info: FunctionImportInfo = unsafe { core::mem::zeroed() };
+
+            let mut function_info: FunctionImportInfo = FunctionImportInfo::default();
 
             let thunk_data = unsafe {
                 transmute::<usize, PIMAGE_IMPORT_BY_NAME>(
@@ -163,7 +166,7 @@ pub fn get_imports(base: *mut u8) -> Option<Vec<ImportInfo>> {
                     .to_string()
             };
 
-            function_info.address = unsafe { &(*(*current_first_thunk).u1.Function()) } as *const _;
+            function_info.address = unsafe { &*(*current_first_thunk).u1.Function() } as *const _ as usize;
 
             info.function_info.push(function_info);
 

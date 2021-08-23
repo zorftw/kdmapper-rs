@@ -3,6 +3,7 @@ compile_error!("Can't compile, this is exclusive to Windows.");
 
 pub mod util;
 pub mod nt;
+pub mod service;
 pub mod pe;
 
 fn main() {

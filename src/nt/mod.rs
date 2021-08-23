@@ -43,10 +43,10 @@ pub fn query_system_information(buffer: &mut usize, size: &mut u64) -> NTSTATUS 
     }
 
     let query_system_info = unsafe {
-        transmute::<FARPROC, fn(i32, *mut usize, u64, *const u64) -> NTSTATUS>(
+        transmute::<FARPROC, unsafe extern "system" fn(i32, *mut usize, u64, *const u64) -> NTSTATUS>(
             query_system_info_address,
         )
     };
 
-    query_system_info(11, buffer as _, *size, size)
+    unsafe { query_system_info(11, buffer as _, *size, size) }
 }

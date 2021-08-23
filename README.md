@@ -10,4 +10,4 @@ cargo build --release
 ```
 
 # dependencies
-1. win-api
+* win-api
