@@ -8,7 +8,7 @@ if the repo contained binaries. So I removed it for that purpose. Note: It's loc
 # warning
 Currently still very much in development, it runs on Windows 20H2 succesfully
 
-!image_info[](img/fn.png)
+![Screenshot](img/fn.png)
 
 # how to compile
 ```
