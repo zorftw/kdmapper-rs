@@ -8,26 +8,26 @@ use winapi::um::winnt::{
 
 #[derive(Default)]
 pub struct FunctionImportInfo {
-    name: String,
-    address: usize, // NOTE: apparently a pointer to an adress (so void*)
+    pub name: String,
+    pub address: usize, // NOTE: apparently a pointer to an adress (so void*)
 }
 
 impl FunctionImportInfo {
-    pub fn get_address(&self) -> *const u64 {
+    pub fn get_address(&self) -> *mut u64 {
         self.address as _
     }
 }
 
 pub struct RelocationInfo {
-    address: u64,
-    item: *const u16,
-    count: i32,
+    pub address: u64,
+    pub item: *const u16,
+    pub count: i32,
 }
 
 #[derive(Default)]
 pub struct ImportInfo {
-    name: String,
-    function_info: Vec<FunctionImportInfo>,
+    pub name: String,
+    pub function_info: Vec<FunctionImportInfo>,
 }
 
 pub fn get_nt_headers(base: *mut u8) -> PIMAGE_NT_HEADERS64 {
@@ -117,66 +117,67 @@ pub fn get_imports(base: *mut u8) -> Option<Vec<ImportInfo>> {
         return None;
     }
 
-    let mut result = vec![];
+    unsafe {
+        let import_va = (*nt_headers).OptionalHeader.DataDirectory
+            [IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+            .VirtualAddress;
 
-    let mut current_import_descriptor = unsafe {
-        transmute::<usize, PIMAGE_IMPORT_DESCRIPTOR>(
-            base as usize
-                + (*nt_headers).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
-                    .VirtualAddress as usize,
-        )
-    };
-
-    while unsafe { (*current_import_descriptor).FirstThunk } != 0 {
-        let mut info = ImportInfo::default();
-
-        info.name = unsafe {
-            CStr::from_ptr(transmute::<usize, *const i8>(
-                base as usize + (*current_import_descriptor).Name as usize,
-            ))
-            .to_str()
-            .unwrap_or_default()
-            .to_string()
-        };
-        let mut current_first_thunk = unsafe {
-            transmute::<usize, PIMAGE_THUNK_DATA64>(
-                base as usize + (*current_import_descriptor).FirstThunk as usize,
-            )
-        };
-        let mut current_original_first_thunks = unsafe {
-            transmute::<usize, PIMAGE_THUNK_DATA64>(
-                base as usize + *(*current_import_descriptor).u.OriginalFirstThunk() as usize,
-            )
-        };
-
-        while unsafe { *(*current_original_first_thunks).u1.Function() != 0 } {
-
-            let mut function_info: FunctionImportInfo = FunctionImportInfo::default();
-
-            let thunk_data = unsafe {
-                transmute::<usize, PIMAGE_IMPORT_BY_NAME>(
-                    base as usize + *(*current_original_first_thunks).u1.AddressOfData() as usize,
-                )
-            };
-
-            function_info.name = unsafe {
-                CStr::from_ptr((*thunk_data).Name.as_ptr())
-                    .to_str()
-                    .unwrap_or_default()
-                    .to_string()
-            };
-
-            function_info.address = unsafe { &*(*current_first_thunk).u1.Function() } as *const _ as usize;
-
-            info.function_info.push(function_info);
-
-            current_first_thunk = unsafe { current_first_thunk.offset(1) };
-            current_original_first_thunks = unsafe { current_first_thunk.offset(1) };
+        if import_va == 0 {
+            return None;
         }
 
-        result.push(info);
-        current_import_descriptor = unsafe { current_import_descriptor.offset(1) };
-    }
+        let mut vec_imports = Vec::new();
 
-    Some(result)
+        let mut current_import_descriptor =
+            (base as usize + import_va as usize) as PIMAGE_IMPORT_DESCRIPTOR;
+
+        while (*current_import_descriptor).FirstThunk != 0 {
+            let mut import_info = ImportInfo::default();
+
+            import_info.name = CStr::from_ptr(
+                (base as usize + (*current_import_descriptor).Name as usize) as *const i8,
+            )
+            .to_str()
+            .expect("Couldn't convert to str")
+            .to_string();
+
+            let mut current_first_thunk = (base as usize
+                + (*current_import_descriptor).FirstThunk as usize)
+                as PIMAGE_THUNK_DATA64;
+            let mut current_original_first_thunk = (base as usize
+                + *(*current_import_descriptor).u.OriginalFirstThunk() as usize)
+                as PIMAGE_THUNK_DATA64;
+
+            while (*(*current_original_first_thunk).u1.Function()) != 0 {
+                let mut import_function_data = FunctionImportInfo::default();
+
+                let thunk_data = (base as usize
+                    + *(*current_original_first_thunk).u1.AddressOfData() as usize)
+                    as PIMAGE_IMPORT_BY_NAME;
+
+                import_function_data.name = CStr::from_ptr((*thunk_data).Name.as_ptr())
+                    .to_str()
+                    .expect("couldn't convert to str")
+                    .to_string();
+                import_function_data.address =
+                    (*current_first_thunk).u1.Function_mut() as *mut u64 as usize;
+
+                import_info.function_info.push(import_function_data);
+
+                current_original_first_thunk = (current_original_first_thunk as usize
+                    + std::mem::size_of::<PIMAGE_THUNK_DATA64>())
+                    as PIMAGE_THUNK_DATA64;
+                current_first_thunk = (current_first_thunk as usize
+                    + std::mem::size_of::<PIMAGE_THUNK_DATA64>())
+                    as PIMAGE_THUNK_DATA64;
+            }
+
+            vec_imports.push(import_info);
+            current_import_descriptor = (current_import_descriptor as usize
+                + std::mem::size_of::<PIMAGE_IMPORT_DESCRIPTOR>())
+                as PIMAGE_IMPORT_DESCRIPTOR;
+        }
+
+        Some(vec_imports)
+    }
 }

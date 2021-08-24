@@ -1,12 +1,18 @@
 use core::panic;
 use std::{
-    ffi::{CStr, CString},
+    ffi::CStr,
     io::{Read, Write},
+    path::{Path, PathBuf},
 };
 
 use winapi::{
-    shared::ntdef::NT_SUCCESS,
+    ctypes::c_void,
+    shared::{
+        minwindef::DWORD,
+        ntdef::{NT_SUCCESS, ULONG},
+    },
     um::{
+        errhandlingapi::SetLastError,
         libloaderapi::{GetProcAddress, LoadLibraryA},
         memoryapi::{VirtualAlloc, VirtualFree},
         winnt::{
@@ -23,31 +29,37 @@ use winapi::{
     },
 };
 
+pub static DRIVER_NAME: &str = "iqvw64e.sys\0";
+
 use crate::{
-    nt,
+    nt::{self, RtlProcessModuleInformation},
     service::{self, force_write_memory, read_memory},
     util,
 };
 
-pub fn create_file_from_memory(file: &str, address: usize, size: usize) -> bool {
-    let mut file = std::fs::File::create(file).expect("Couldn't create/open file!");
+pub fn get_temporary_folder_path() -> PathBuf {
+    std::env::temp_dir()
+}
 
-    let mut data = vec![0u8; size]; // spawn a buffer size of the memory
-    unsafe {
-        std::ptr::copy(
-            address as *const i8,
-            data.as_mut_ptr() as *mut _,
-            data.len(),
-        )
-    };
+pub fn get_path_to_driver() -> PathBuf {
+    let mut path = get_temporary_folder_path();
+    path.push(DRIVER_NAME.strip_suffix('\0').unwrap());
 
-    file.write_all(data.as_slice())
-        .expect("Couldn't write file");
+    path
+}
+
+pub fn create_driver_file(file: &String) -> bool {
+    let mut file = std::fs::File::create(Path::new(file)).expect("Couldn't create/open file!");
+
+    // Thank god for this macro!
+    let driver = include_bytes!("../mapper/driver.sys");
+
+    file.write_all(driver).expect("Couldn't write file");
 
     true
 }
 
-pub fn read_file_from_memory(file: &str, buffer: &mut Vec<u8>) -> bool {
+pub fn read_file_to_memory(file: &String, buffer: &mut Vec<u8>) -> bool {
     let mut file = std::fs::File::open(file).expect("Couldn't open file");
 
     file.read_to_end(buffer).expect("Couldn't read file");
@@ -55,15 +67,19 @@ pub fn read_file_from_memory(file: &str, buffer: &mut Vec<u8>) -> bool {
     true
 }
 
-pub fn create_and_start_service(file: &str) -> bool {
-    let filename = CString::new(
-        std::path::Path::new(file)
-            .file_name()
-            .expect("Couldn't get filname")
-            .to_str()
-            .expect("Couldn't convert to str"),
-    )
-    .expect("Couldn't convert to CString");
+pub fn create_and_start_service(file: &String) -> bool {
+    let mut filename = std::path::Path::new(file)
+        .file_name()
+        .expect("Couldn't get filname")
+        .to_str()
+        .expect("Couldn't convert to str")
+        .to_string();
+    filename.push('\0');
+
+    println!("File name: {}", filename);
+
+    let mut actual_file_path = file.to_owned();
+    actual_file_path.push('\0');
 
     let manager = unsafe {
         OpenSCManagerA(
@@ -80,13 +96,13 @@ pub fn create_and_start_service(file: &str) -> bool {
     let mut service = unsafe {
         CreateServiceA(
             manager,
-            filename.as_ptr(),
-            filename.as_ptr(),
+            DRIVER_NAME.as_ptr() as _,
+            DRIVER_NAME.as_ptr() as _,
             SERVICE_START | SERVICE_STOP | DELETE,
             SERVICE_KERNEL_DRIVER,
             SERVICE_DEMAND_START,
             SERVICE_ERROR_IGNORE,
-            file.as_ptr() as *const i8,
+            actual_file_path.as_ptr() as _,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -98,7 +114,7 @@ pub fn create_and_start_service(file: &str) -> bool {
     if service.is_null() {
         println!("Unable to create service, attempting to open instead");
 
-        service = unsafe { OpenServiceA(manager, filename.as_ptr(), SERVICE_START) };
+        service = unsafe { OpenServiceA(manager, filename.as_ptr() as _, SERVICE_START) };
 
         if service.is_null() {
             unsafe { CloseServiceHandle(manager) };
@@ -152,14 +168,14 @@ pub fn delete_and_stop_service(name: &str) -> bool {
     result
 }
 
-pub fn get_kernel_module_address(name: &str) -> usize {
-    let mut buffer: usize = 0;
-    let mut buffer_size = 0u64;
+pub fn get_kernel_module_address(name: String) -> u64 {
+    let mut buffer: *mut c_void = std::ptr::null_mut();
+    let mut buffer_size: DWORD = 0;
 
-    let mut system_info = nt::query_system_information(&mut buffer, &mut buffer_size);
+    let mut system_info = nt::query_system_information(buffer, &mut buffer_size);
 
-    while system_info as u32 == nt::STATUS_INFO_LENGHT_MISMATCH {
-        unsafe { VirtualFree(buffer as _, 0, MEM_RELEASE) };
+    while system_info.result as u32 == nt::STATUS_INFO_LENGHT_MISMATCH {
+        unsafe { VirtualFree(buffer, 0, MEM_RELEASE) };
 
         buffer = unsafe {
             VirtualAlloc(
@@ -169,40 +185,56 @@ pub fn get_kernel_module_address(name: &str) -> usize {
                 PAGE_READWRITE,
             )
         } as _;
-        system_info = nt::query_system_information(&mut buffer, &mut buffer_size);
+        system_info = nt::query_system_information(buffer, &mut buffer_size);
     }
 
-    if !NT_SUCCESS(system_info) {
-        unsafe { VirtualFree(buffer as _, 0, MEM_RELEASE) };
-        return 0usize;
+    if !NT_SUCCESS(system_info.result) {
+        unsafe { VirtualFree(system_info.buffer, 0, MEM_RELEASE) };
+        return 0u64;
     }
 
-    let modules: nt::RtlProcessModules = unsafe { (buffer as *mut nt::RtlProcessModules).read() };
+    let modules = buffer as *mut nt::RtlProcessModules;
 
-    for i in 0..modules.number_of_modules {
-        let module_name = unsafe {
-            CStr::from_ptr(
-                (modules.modules[i as usize].full_path_name.as_ptr() as usize
-                    + modules.modules[i as usize].offset_to_file_name as usize)
-                    as _,
-            )
-            .to_str()
-            .expect("Couldn't parse name")
-            .to_string()
-        };
+    unsafe {
+        for i in 0..(*modules).number_of_modules {
+            let current_module = (buffer as usize
+                + std::mem::size_of::<ULONG>()
+                + i as usize * std::mem::size_of::<RtlProcessModuleInformation>())
+                as *mut RtlProcessModuleInformation;
 
-        if module_name.eq(name) {
-            let result = modules.modules[i as usize].image_base as usize;
+            let module_name = String::from_utf8(
+                (*current_module)
+                    .full_path_name
+                    .iter()
+                    .skip(4)
+                    .map(|i| *i as u8)
+                    .take_while(|&i| i as char != char::from(0))
+                    .collect(),
+            );
 
-            unsafe { VirtualFree(buffer as _, 0, MEM_RELEASE) };
+            if !module_name.is_ok() {
+                continue;
+            }
 
-            return result;
+            let actual_name = module_name.unwrap();
+
+            let image_base_test =
+                current_module as usize + std::mem::size_of::<*mut c_void>() * 2usize;
+
+            if actual_name.contains(&name) {
+                let result = ((image_base_test + 4usize) as *mut u64).read();
+                VirtualFree(buffer as _, 0, MEM_RELEASE);
+
+                // Due to call earlier we get an invalid address error-code, we can just clear it and ignore it.
+                SetLastError(0);
+
+                return result;
+            }
         }
     }
 
     unsafe { VirtualFree(buffer as _, 0, MEM_RELEASE) };
-
-    0usize
+    0u64
 }
 
 pub fn get_kernel_module_export(service: HANDLE, kernel_module_base: u64, fn_name: &str) -> u64 {
@@ -219,13 +251,16 @@ pub fn get_kernel_module_export(service: HANDLE, kernel_module_base: u64, fn_nam
         &mut dos_header as *mut IMAGE_DOS_HEADER as _,
         std::mem::size_of::<IMAGE_DOS_HEADER>() as _,
     ) || dos_header.e_magic != IMAGE_DOS_SIGNATURE
-        || !service::read_memory(
-            service,
-            kernel_module_base + dos_header.e_lfanew as u64,
-            &mut nt_header as *mut IMAGE_NT_HEADERS64 as _,
-            std::mem::size_of::<IMAGE_NT_HEADERS64>() as _,
-        )
-        || nt_header.Signature != IMAGE_NT_SIGNATURE
+    {
+        return 0;
+    }
+
+    if !service::read_memory(
+        service,
+        kernel_module_base + dos_header.e_lfanew as u64,
+        &mut nt_header as *mut IMAGE_NT_HEADERS64 as _,
+        std::mem::size_of::<IMAGE_NT_HEADERS64>() as _,
+    ) || nt_header.Signature != IMAGE_NT_SIGNATURE
     {
         return 0;
     }
@@ -260,17 +295,25 @@ pub fn get_kernel_module_export(service: HANDLE, kernel_module_base: u64, fn_nam
 
     let delta = export_data as u64 - export_base as u64;
 
-    let name_table = unsafe { ((*export_data).AddressOfNames + delta as u32) as *mut u32 };
+    let name_table = unsafe { ((*export_data).AddressOfNames as u64 + delta) as *mut u32 };
     let ordinal_table =
-        unsafe { ((*export_data).AddressOfNameOrdinals + delta as u32) as *mut u16 };
-    let function_table = unsafe { ((*export_data).AddressOfFunctions + delta as u32) as *mut u32 };
+        unsafe { ((*export_data).AddressOfNameOrdinals as u64 + delta) as *mut u16 };
+    let function_table = unsafe { ((*export_data).AddressOfFunctions as u64 + delta) as *mut u32 };
 
     for i in 0..unsafe { (*export_data).NumberOfNames } as isize {
-        let current_function_name =
-            unsafe { CStr::from_ptr((name_table.offset(i).read() as u64 + delta) as _) }
+        // let current_function_name =
+        //     unsafe { CString::from_raw((name_table.offset(i).read() as u64 + delta) as _) }
+        //         .to_str()
+        //         .expect("Couldn't convert to str")
+        //         .to_string();
+        let name_ptr = unsafe { name_table.offset(i).read() as u64 + delta } as *mut char;
+        let current_function_name = unsafe {
+            CStr::from_ptr(name_ptr as _)
+                .to_owned()
                 .to_str()
-                .expect("Couldn't convert to str")
-                .to_string();
+                .unwrap()
+                .to_string()
+        };
 
         if current_function_name.eq(fn_name) {
             let fn_ordinal = unsafe { ordinal_table.offset(i).read() };
@@ -290,7 +333,7 @@ pub fn get_kernel_module_export(service: HANDLE, kernel_module_base: u64, fn_nam
     }
 
     unsafe { VirtualFree(export_data as _, 0, MEM_RELEASE) };
-    panic!("Couldn't find export...");
+    panic!("Couldn't find export: {}...", fn_name);
 }
 
 pub fn get_nt_gdi_dd_ddl_reclaim_allocations_info(
@@ -306,7 +349,7 @@ pub fn get_nt_gdi_dd_ddl_reclaim_allocations_info(
     if unsafe { KERNEL_FUNCTION_PTR == 0 || KERNEL_ORIGINAL_FUNCTION_ADDRESS == 0 } {
         let nt_gdi_ddi_reclaim_allocations2 = get_kernel_module_export(
             service,
-            util::get_kernel_module_address("win32kbase.sys") as _,
+            util::get_kernel_module_address("win32kbase.sys".to_string()) as _,
             "NtGdiDdDDIReclaimAllocations2",
         );
 
@@ -321,7 +364,7 @@ pub fn get_nt_gdi_dd_ddl_reclaim_allocations_info(
         if !read_memory(
             service,
             kernel_function_ptr_offset_address,
-            &mut function_ptr_offset,
+            &mut function_ptr_offset as *mut _ as u64,
             std::mem::size_of::<usize>() as _,
         ) {
             return false;
@@ -335,7 +378,7 @@ pub fn get_nt_gdi_dd_ddl_reclaim_allocations_info(
             !read_memory(
                 service,
                 KERNEL_FUNCTION_PTR,
-                &mut KERNEL_ORIGINAL_FUNCTION_ADDRESS as *mut u64 as *mut _,
+                &mut KERNEL_ORIGINAL_FUNCTION_ADDRESS as *mut _ as u64,
                 std::mem::size_of::<u64>() as _,
             )
         } {
@@ -362,7 +405,7 @@ pub fn get_nt_gdi_get_copp_compatible_opm_information_info(
 
         let nt_gdi_get_copp_compatible_opm_information_info = get_kernel_module_export(
             service,
-            get_kernel_module_address("win32kbase.sys") as _,
+            get_kernel_module_address("win32kbase.sys".to_string()) as _,
             "NtGdiGetCOPPCompatibleOPMInformation",
         );
 
@@ -370,17 +413,19 @@ pub fn get_nt_gdi_get_copp_compatible_opm_information_info(
             println!("Unable to find NtGdiGetCOPPCompatibleOPMInformation");
             return false;
         }
-
-        unsafe { KERNEL_FUNCTION_PTR = nt_gdi_get_copp_compatible_opm_information_info };
+        unsafe {
+            KERNEL_FUNCTION_PTR = nt_gdi_get_copp_compatible_opm_information_info;
+        }
 
         if unsafe {
             !read_memory(
                 service,
                 KERNEL_FUNCTION_PTR,
-                KERNEL_ORIGINAL_BYTES.as_mut_ptr() as *mut _,
+                KERNEL_ORIGINAL_BYTES.as_mut_ptr() as *mut _ as u64,
                 (std::mem::size_of::<u8>() * KERNEL_ORIGINAL_BYTES.len() as usize) as _,
             )
         } {
+            println!("ReadMemory failed!!");
             return false;
         }
     }
@@ -397,113 +442,172 @@ pub fn get_nt_gdi_get_copp_compatible_opm_information_info(
     true
 }
 
-// Since rust doesn't support variadic arguments as of now, we will return a pointer to the function, we have no choice.
+// Smart way to do this eh?
 pub fn call_kernel_fn(
     service: HANDLE,
     call_function: &mut dyn FnMut(*mut usize) -> bool,
-    mut kernel_function_address: u64,
+    kernel_function_address: u64,
 ) -> bool {
     if kernel_function_address == 0 {
-        return false;
+        panic!("Kernel export apparently 0? What are we gonna do about it?");
     }
 
     // Wrap entire function because why not.
     unsafe {
-        let nt_gdi_dd_ddi_reclaim_allocations = GetProcAddress(
-            LoadLibraryA("gdi32full.dll".as_ptr() as _),
-            "NtGdiDdDDIReclaimAllocations2".as_ptr() as _,
-        );
-        let nt_gdi_get_copp_compatible_opm_information = GetProcAddress(
-            LoadLibraryA("win32u.dll".as_ptr() as _),
-            "NtGdiGetCOPPCompatibleOPMInformation".as_ptr() as _,
+        let nt_query_information_atom = GetProcAddress(
+            LoadLibraryA("ntdll.dll\0".as_ptr() as _),
+            "NtQueryInformationAtom\0".as_ptr() as _,
         );
 
-        if nt_gdi_dd_ddi_reclaim_allocations.is_null()
-            && nt_gdi_get_copp_compatible_opm_information.is_null()
-        {
-            panic!("Failed to find NtGdiDdDDIReclaimAllocations2 or NtGdiGetCOPPCompatibleOPMInformation");
+        if nt_query_information_atom.is_null() {
+            panic!("Couldn't find target function, are you on 20h2?")
         }
 
-        let mut kernel_fn_pointer: u64 = 0;
-        let mut kernel_function_jmp: [u8; 12] = [
+        let mut kernel_injected_jmp: [u8; 12] = [
             0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xe0,
         ];
-        let mut kernel_original_function_address: u64 = 0;
-        let mut kernel_original_function_jmp = vec![0u8, 12];
+        let mut original_kernel_fn = vec![0u8; 12];
 
-        if !nt_gdi_dd_ddi_reclaim_allocations.is_null() {
-            // Get function pointer (@win32kbase!gDxgkInterface table) used by NtGdiDdDDIReclaimAllocations2
-            // and save the original address (dxgkrnl!DxgkReclaimAllocations2)
-            if !get_nt_gdi_dd_ddl_reclaim_allocations_info(
-                service,
-                &mut kernel_fn_pointer,
-                &mut kernel_original_function_address,
-            ) {
-                return false;
-            }
+        ((kernel_injected_jmp.as_mut_ptr() as usize + 2usize) as *mut u64)
+            .write(kernel_function_address);
 
-            // Overwrite the pointer with kernel_function_address
-            if !force_write_memory(
-                service,
-                kernel_fn_pointer,
-                &mut kernel_function_address as *mut u64 as _,
-                std::mem::size_of::<u64>() as _,
-            ) {
-                return false;
-            }
-        } else {
-            if !get_nt_gdi_get_copp_compatible_opm_information_info(
-                service,
-                &mut kernel_fn_pointer,
-                kernel_original_function_jmp.as_mut_ptr(),
-            ) {
-                return false;
-            }
+        let kernel_nt_query_information_atom = get_kernel_module_export(
+            service,
+            get_kernel_module_address("ntoskrnl.exe".to_string()),
+            "NtQueryInformationAtom",
+        );
 
-            // Overwrite jmp with 'movabs rax, <kernel_function_address>, jmp rax'
-            std::ptr::copy(
-                &kernel_function_address,
-                (kernel_function_jmp.as_ptr() as usize + 2usize) as _,
-                std::mem::size_of::<u64>(),
-            );
-
-            if !force_write_memory(
-                service,
-                kernel_fn_pointer,
-                kernel_function_jmp.as_mut_ptr() as *mut _,
-                (std::mem::size_of::<u8>() * kernel_function_jmp.len() as usize) as _,
-            ) {
-                return false;
-            }
+        if kernel_nt_query_information_atom == 0 {
+            println!("Couldn't get export ntoskrnl.NtQueryInformationAtom");
+            return false;
         }
 
-        let mut function = std::ptr::null_mut();
-        if !nt_gdi_get_copp_compatible_opm_information.is_null() {
-            function = nt_gdi_get_copp_compatible_opm_information;
-        } else if !nt_gdi_dd_ddi_reclaim_allocations.is_null() {
-            function = nt_gdi_dd_ddi_reclaim_allocations;
+        if !read_memory(
+            service,
+            kernel_nt_query_information_atom,
+            original_kernel_fn.as_mut_ptr() as _,
+            kernel_injected_jmp.len() as _,
+        ) {
+            println!("Couldn't read memory");
+            return false;
         }
 
-        if !function.is_null() {
-            call_function(function as _);
+        if !force_write_memory(
+            service,
+            kernel_nt_query_information_atom,
+            kernel_injected_jmp.as_ptr() as _,
+            kernel_injected_jmp.len() as _,
+        ) {
+            println!("Couldn't write memory");
+            return false;
         }
 
-        if !nt_gdi_dd_ddi_reclaim_allocations.is_null() {
-            force_write_memory(
-                service,
-                kernel_fn_pointer,
-                &mut kernel_original_function_address as *mut u64 as _,
-                std::mem::size_of::<u64>() as _,
-            );
-        } else {
-            force_write_memory(
-                service,
-                kernel_fn_pointer,
-                kernel_original_function_jmp.as_mut_ptr() as *mut _,
-                (std::mem::size_of::<u8>() * kernel_function_jmp.len() as usize) as _,
-            );
+        call_function(nt_query_information_atom as _);
+
+        if !force_write_memory(
+            service,
+            kernel_nt_query_information_atom,
+            original_kernel_fn.as_mut_ptr() as _,
+            original_kernel_fn.len() as _,
+        ) {
+            println!("Couldn't restore function!");
+            return false;
         }
+
+        // NOTE: this is for older versions of windows!
+        // let nt_gdi_dd_ddi_reclaim_allocations = GetProcAddress(
+        //     LoadLibraryA("gdi32full.dll\0".as_ptr() as _),
+        //     "NtGdiDdDDIReclaimAllocations2\0".as_ptr() as _,
+        // );
+        // let nt_gdi_get_copp_compatible_opm_information = GetProcAddress(
+        //     LoadLibraryA("win32u.dll\0".as_ptr() as _),
+        //     "NtGdiGetCOPPCompatibleOPMInformation\0".as_ptr() as _,
+        // );
+
+        // if nt_gdi_dd_ddi_reclaim_allocations.is_null()
+        //     && nt_gdi_get_copp_compatible_opm_information.is_null()
+        // {
+        //     panic!("Failed to find NtGdiDdDDIReclaimAllocations2 or NtGdiGetCOPPCompatibleOPMInformation");
+        // }
+
+        // let mut kernel_fn_pointer: u64 = 0;
+        // let mut kernel_original_function_address: u64 = 0;
+        // let mut kernel_original_function_jmp = vec![0u8, 12];
+
+        // if !nt_gdi_dd_ddi_reclaim_allocations.is_null() {
+        //     // Get function pointer (@win32kbase!gDxgkInterface table) used by NtGdiDdDDIReclaimAllocations2
+        //     // and save the original address (dxgkrnl!DxgkReclaimAllocations2)
+        //     if !get_nt_gdi_dd_ddl_reclaim_allocations_info(
+        //         service,
+        //         &mut kernel_fn_pointer,
+        //         &mut kernel_original_function_address,
+        //     ) {
+        //         return false;
+        //     }
+
+        //     // Overwrite the pointer with kernel_function_address
+        //     if !force_write_memory(
+        //         service,
+        //         kernel_fn_pointer,
+        //         &mut kernel_function_address as *mut u64 as _,
+        //         std::mem::size_of::<u64>() as _,
+        //     ) {
+        //         return false;
+        //     }
+        // } else {
+        //     if !get_nt_gdi_get_copp_compatible_opm_information_info(
+        //         service,
+        //         &mut kernel_fn_pointer,
+        //         kernel_original_function_jmp.as_mut_ptr(),
+        //     ) {
+        //         return false;
+        //     }
+
+        //     // Overwrite jmp with 'movabs rax, <kernel_function_address>, jmp rax'
+        //     std::ptr::copy(
+        //         &kernel_function_address,
+        //         (kernel_function_jmp.as_ptr() as usize + 2usize) as _,
+        //         std::mem::size_of::<u64>(),
+        //     );
+
+        //     if !force_write_memory(
+        //         service,
+        //         kernel_fn_pointer,
+        //         kernel_function_jmp.as_mut_ptr() as *mut _,
+        //         (std::mem::size_of::<u8>() * kernel_function_jmp.len() as usize) as _,
+        //     ) {
+        //         return false;
+        //     }
+        // }
+
+        // let mut function = std::ptr::null_mut();
+        // if !nt_gdi_get_copp_compatible_opm_information.is_null() {
+        //     function = nt_gdi_get_copp_compatible_opm_information;
+        // } else if !nt_gdi_dd_ddi_reclaim_allocations.is_null() {
+        //     function = nt_gdi_dd_ddi_reclaim_allocations;
+        // }
+
+        // if !function.is_null() {
+        //     call_function(function as _);
+        // }
+
+        // if !nt_gdi_get_copp_compatible_opm_information.is_null() {
+        //     force_write_memory(
+        //         service,
+        //         kernel_fn_pointer,
+        //         &mut kernel_original_function_address as *mut u64 as _,
+        //         std::mem::size_of::<u64>() as _,
+        //     );
+        // } else {
+        //     force_write_memory(
+        //         service,
+        //         kernel_fn_pointer,
+        //         kernel_original_function_jmp.as_mut_ptr() as *mut _,
+        //         (std::mem::size_of::<u8>() * kernel_function_jmp.len() as usize) as _,
+        //     );
+        // }
     }
 
+    println!("Succesfully called kernel fn!");
     true
 }

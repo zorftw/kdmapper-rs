@@ -16,4 +16,6 @@ winapi = { version = "0.3", features = [
     "winsvc",
     "libloaderapi",
     "ioapiset",
+    "fileapi",
+    "dbghelp",
 ] }
